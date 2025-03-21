@@ -1,0 +1,32 @@
+{
+  "information_schema.tables": {
+    "columns": {
+      "table_name": "TEXT"
+    },
+    "relationships": []
+  },
+  "information_schema.columns": {
+    "columns": {
+      "column_name": "TEXT",
+      "data_type": "TEXT"
+    },
+    "relationships": []
+  },
+  "jobs": {
+    "columns": {
+      "job_id": "TEXT",
+      "min_salary": "TEXT",
+      "max_salary": "TEXT",
+      "job_title": "TEXT"
+    },
+    "relationships": []
+  },
+  "departments": {
+    "columns": {
+      "department_id": "TEXT",
+      "department_name": "TEXT",
+      "location_id": "TEXT"
+    },
+    "relationships": []
+  }
+}

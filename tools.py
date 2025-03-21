@@ -10,7 +10,7 @@ from agents import function_tool
 import time
 import logging
 import threading
-
+import re
 
 # Configure logging
 logging.basicConfig(filename='sql_agent.log', level=logging.INFO,
@@ -178,70 +178,99 @@ connection_manager = ConnectionManager(DB_CONFIG)
 # List to store all executed queries
 all_queries = []
 
+class DatabaseSchemaMemory:
+    def __init__(self):
+        self.schema = {}
+        self.load_schema()
+        
+    def load_schema(self):
+        try:
+            with open('schema_memory.json', 'r') as f:
+                self.schema = json.load(f)
+            db_logger.info("Loaded database schema from memory")
+        except FileNotFoundError:
+            db_logger.warning("No existing schema memory found")
+
+    def save_schema(self):
+        with open('schema_memory.json', 'w') as f:
+            json.dump(self.schema, f, indent=2)
+        db_logger.info("Saved database schema to memory")
+
+    def update_from_query(self, query, result=None):
+        try:
+            query = query.lower()
+            
+            if 'create table' in query:
+                table_name = query.split('create table')[-1].split('(')[0].strip()
+                columns = re.findall(r'(\w+)\s+([\w\(\)]+)', query.split('(', 1)[-1].split(')')[0])
+                self.schema[table_name] = {
+                    'columns': {col[0]: col[1] for col in columns},
+                    'relationships': []
+                }
+                db_logger.info(f"Updated schema with new table: {table_name}")
+
+            elif 'alter table' in query:
+                table_name = query.split('alter table')[-1].split('add')[0].strip()
+                if 'add column' in query:
+                    column_def = query.split('add column')[-1].strip()
+                    col_name, col_type = re.match(r'(\w+)\s+([\w\(\)]+)', column_def).groups()
+                    self.schema[table_name]['columns'][col_name] = col_type
+                    db_logger.info(f"Added column {col_name} to {table_name}")
+
+            elif result and 'select' in query:
+                try:
+                    data = json.loads(result)
+                    if 'query_result' in data and isinstance(data['query_result'], list):
+                        first_row = data['query_result'][0]
+                        table_name = query.split('from')[-1].split()[0].strip()
+                        if table_name not in self.schema:
+                            self.schema[table_name] = {
+                                'columns': {k: 'TEXT' for k in first_row.keys()},
+                                'relationships': []
+                            }
+                            db_logger.info(f"Inferred schema for {table_name} from query results")
+                except Exception as e:
+                    db_logger.error(f"Schema inference error: {str(e)}")
+
+        except Exception as e:
+            db_logger.error(f"Schema update failed: {str(e)}")
+        finally:
+            self.save_schema()
+
+# Initialize memory system
+schema_memory = DatabaseSchemaMemory()
+
 @function_tool
 async def execute_sql(query: str) -> str:
-    """
-    Execute a SQL query and return the result.
-    
-    Args:
-        query: SQL query to execute
-    
-    Returns:
-        String representation of the query results
-    """
+    global all_queries
     llm = LLM()
     llm.start()
     start_time = time.time()
-    # Log the query being executed
-    logging.info(f"LLM executed SQL query: {query}")
-    db_logger.info(f"Executing SQL query: {query}")
-
-    # Store the query
-    global all_queries
-    
-
-    
     try:
-        # Get connection from connection manager
         conn = connection_manager.get_connection()
-        
-        # Create a cursor with dictionary-like results
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Execute the query
             cursor.execute(query)
-
-            print("cursor description", cursor.description)            
-            # Check if the query is a SELECT query (returns results)
-            if cursor.description:
-                # Fetch all results
+            
+            schema_memory.update_from_query(query)
+            
+            if query.strip().lower().startswith('select'):
                 results = cursor.fetchall()
-                print("results", results)
-
-                # Convert results to a list of dictionaries
-                result_list = [dict(row) for row in results]
-                
-                # Format the results as a JSON string with indentation for readability
-                formatted_results = json.dumps(result_list, indent=2, default=str)
-                print("formatted_results", formatted_results)
-                execution_time = time.time() - start_time
-                all_queries.append((query, execution_time))
-                logging.info(f'LLM executed SQL query: {query} (Execution time: {execution_time:.2f}s)')
-                llm.end()
-                return json.dumps({'query_result': formatted_results, 'all_queries': all_queries})
+                formatted_results = [dict(row) for row in results]
+                schema_memory.update_from_query(query, json.dumps({'query_result': formatted_results}))
+                response = json.dumps({'query_result': formatted_results, 
+                                     'schema': schema_memory.schema,
+                                     'all_queries': all_queries})
             else:
-                # For non-SELECT queries (INSERT, UPDATE, DELETE)
-                conn.commit()
                 affected_rows = cursor.rowcount
-                print("affected_rows", affected_rows)
-                execution_time = time.time() - start_time
-                all_queries.append((query, execution_time))
-                logging.info(f'LLM executed SQL query: {query} (Execution time: {execution_time:.2f}s)')
-                llm.end()
-                return json.dumps({'query_result': f"Query executed successfully. Rows affected: {affected_rows}", 'all_queries': all_queries})
-    
+                response = json.dumps({'query_result': f"Rows affected: {affected_rows}",
+                                     'schema': schema_memory.schema,
+                                     'all_queries': all_queries})
+                
+            all_queries.append((query, time.time() - start_time))
+            return response
+            
     except Exception as e:
-        execution_time = time.time() - start_time
-        all_queries.append((query, execution_time))
-        logging.error(f'Error executing SQL query: {query} (Execution time: {execution_time:.2f}s) - Error: {str(e)}')
+        db_logger.error(f"Query execution failed: {str(e)}")
+        return json.dumps({'error': str(e), 'schema': schema_memory.schema})
+    finally:
         llm.end()
-        return json.dumps({'query_result': f"Error executing SQL query: {str(e)}", 'all_queries': all_queries})
