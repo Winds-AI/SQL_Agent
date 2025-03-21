@@ -1,8 +1,9 @@
 # main.py
 
-from agents import Agent, Runner
+from agents import Agent, Runner, set_trace_processors
 from tools import execute_sql
 from dotenv import load_dotenv
+from openai_agents import OpenAIAgentsTracingProcessor
 load_dotenv()
 
 # Create an agent with the SQL execution tool
@@ -37,4 +38,5 @@ def test_sql_agent():
 
 if __name__ == "__main__":
     print("Testing SQL execution through the Agent...")
+    set_trace_processors([OpenAIAgentsTracingProcessor()])
     test_sql_agent()

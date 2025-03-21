@@ -5,6 +5,7 @@ from main import agent, Runner
 import asyncio
 from tools import all_queries, connection_manager
 import time
+import json
 
 st.title('SQL Assistant')
 
@@ -18,6 +19,19 @@ if 'connection_initialized' not in st.session_state:
 # Input for SQL query
 query = st.text_input("Enter your query here...", placeholder="how many tables do i have")
 
+# Load schema dynamically from schema_memory.json
+with open('/home/meet/Desktop/POC/SQL/schema_memory.json', 'r') as f:
+    schema = json.load(f)
+
+# Pass schema along with user query to LLM
+def pass_query_to_llm(user_query):
+    llm_request = {
+        "query": user_query,
+        "schema": schema
+    }
+    # Call LLM with the request
+    return Runner.run_sync(agent, f"{llm_request}")
+
 if st.button('Execute'):
     start_time = time.time()
     if query.strip():
@@ -27,7 +41,7 @@ if st.button('Execute'):
             
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            result = Runner.run_sync(agent, f"{query}")
+            result = pass_query_to_llm(query)
             st.write('Query Result:')
             st.write(result.final_output)
         except Exception as e:
