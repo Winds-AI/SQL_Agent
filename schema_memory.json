@@ -28,5 +28,12 @@
       "location_id": "TEXT"
     },
     "relationships": []
+  },
+  "regions": {
+    "columns": {
+      "region_id": "TEXT",
+      "region_name": "TEXT"
+    },
+    "relationships": []
   }
 }
