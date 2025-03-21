@@ -10,12 +10,26 @@ from agents import function_tool
 import time
 import logging
 import threading
-import hashlib
-from functools import lru_cache
+
 
 # Configure logging
 logging.basicConfig(filename='sql_agent.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Create a specific logger for database connections
+db_logger = logging.getLogger('database_connection')
+db_logger.setLevel(logging.DEBUG)
+
+# Create file handler for connection logs
+conn_handler = logging.FileHandler('database_connection.log')
+conn_handler.setLevel(logging.DEBUG)
+
+# Create formatter and add it to the handler
+conn_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [CONNECTION] - %(message)s')
+conn_handler.setFormatter(conn_formatter)
+
+# Add the handler to the logger
+db_logger.addHandler(conn_handler)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -47,18 +61,24 @@ class ConnectionManager:
         """Get a database connection, creating a new one if needed or if the existing one has timed out"""
         with self.lock:
             current_time = time.time()
+            idle_time = current_time - self.last_used if self.last_used > 0 else 0
             
             # Check if we need to create a new connection
             if self.connection is None:
-                logging.info("Creating new database connection")
+                db_logger.info(f"Creating new database connection - No existing connection")
                 self.connection = self._create_connection()
+                db_logger.info(f"Connection established to {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']} as user {DB_CONFIG['user']}")
             elif current_time - self.last_used > self.timeout:
-                logging.info("Connection timed out, creating new connection")
+                db_logger.info(f"Connection timed out after {idle_time:.2f}s of inactivity (timeout: {self.timeout}s)")
                 self._close_connection()
                 self.connection = self._create_connection()
+                db_logger.info(f"New connection established after timeout")
             elif not self._is_connection_alive():
-                logging.info("Connection is dead, creating new connection")
+                db_logger.warning(f"Connection is dead after {idle_time:.2f}s of inactivity, creating new connection")
                 self.connection = self._create_connection()
+                db_logger.info(f"New connection established after dead connection detection")
+            else:
+                db_logger.debug(f"Reusing existing connection (idle for {idle_time:.2f}s)")
             
             # Update last used time
             self.last_used = current_time
@@ -70,33 +90,46 @@ class ConnectionManager:
     
     def _create_connection(self):
         """Create a new database connection"""
-        return psycopg2.connect(
-            host=self.db_config['host'],
-            port=self.db_config['port'],
-            database=self.db_config['database'],
-            user=self.db_config['user'],
-            password=self.db_config['password']
-        )
+        start_time = time.time()
+        db_logger.info(f"Attempting to connect to database {self.db_config['database']} at {self.db_config['host']}:{self.db_config['port']}")
+        try:
+            conn = psycopg2.connect(
+                host=self.db_config['host'],
+                port=self.db_config['port'],
+                database=self.db_config['database'],
+                user=self.db_config['user'],
+                password=self.db_config['password']
+            )
+            conn_time = time.time() - start_time
+            db_logger.info(f"Connection established successfully in {conn_time:.4f}s")
+            return conn
+        except Exception as e:
+            db_logger.error(f"Connection failed: {str(e)}")
+            raise
     
     def _is_connection_alive(self):
         """Check if the current connection is still alive"""
         try:
             # Try a simple query to check connection
+            start_time = time.time()
             with self.connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
+                check_time = time.time() - start_time
+                db_logger.debug(f"Connection health check successful in {check_time:.4f}s")
                 return True
         except Exception as e:
-            logging.error(f"Connection check failed: {str(e)}")
+            db_logger.error(f"Connection health check failed: {str(e)}")
             return False
     
     def _close_connection(self):
         """Close the current connection if it exists"""
         if self.connection is not None:
             try:
+                conn_id = id(self.connection)
                 self.connection.close()
-                logging.info("Database connection closed due to timeout")
+                db_logger.info(f"Database connection (id: {conn_id}) closed after {time.time() - self.last_used:.2f}s of inactivity")
             except Exception as e:
-                logging.error(f"Error closing connection: {str(e)}")
+                db_logger.error(f"Error closing connection: {str(e)}")
             finally:
                 self.connection = None
     
@@ -112,57 +145,35 @@ class ConnectionManager:
     def _timeout_callback(self):
         """Callback when connection times out"""
         with self.lock:
-            if self.connection is not None and time.time() - self.last_used > self.timeout:
-                self._close_connection()
+            if self.connection is not None:
+                idle_time = time.time() - self.last_used
+                if idle_time > self.timeout:
+                    db_logger.info(f"Timeout callback triggered after {idle_time:.2f}s of inactivity")
+                    self._close_connection()
+                else:
+                    db_logger.debug(f"Timeout callback checked connection (idle for {idle_time:.2f}s)")
+
+
+class LLM:
+    def __init__(self):
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.time()
+        db_logger.info("LLM operation started")
+
+    def end(self):
+        if self.start_time:
+            duration = time.time() - self.start_time
+            db_logger.info(f"LLM operation completed in {duration:.2f} seconds")
+        else:
+            db_logger.error("LLM operation end called without start")
+
 
 # Initialize the connection manager
 connection_manager = ConnectionManager(DB_CONFIG)
 
-# Query cache with TTL (Time-To-Live)
-class QueryCache:
-    def __init__(self, max_size=100, ttl=300):  # 5 minutes TTL by default
-        self.cache = {}
-        self.max_size = max_size
-        self.ttl = ttl
-        self.lock = threading.Lock()
-    
-    def get(self, query):
-        """Get cached result for a query if it exists and is not expired"""
-        with self.lock:
-            query_hash = self._hash_query(query)
-            if query_hash in self.cache:
-                timestamp, result = self.cache[query_hash]
-                # Check if cache entry is still valid
-                if time.time() - timestamp <= self.ttl:
-                    logging.info(f"Cache hit for query: {query[:50]}...")
-                    return result
-                else:
-                    # Remove expired entry
-                    del self.cache[query_hash]
-            return None
-    
-    def set(self, query, result):
-        """Cache the result of a query"""
-        with self.lock:
-            # Only cache SELECT queries (read-only)
-            if not query.strip().upper().startswith('SELECT'):
-                return
-                
-            query_hash = self._hash_query(query)
-            
-            # If cache is full, remove oldest entry
-            if len(self.cache) >= self.max_size:
-                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][0])
-                del self.cache[oldest_key]
-            
-            self.cache[query_hash] = (time.time(), result)
-    
-    def _hash_query(self, query):
-        """Create a hash of the query for cache key"""
-        return hashlib.md5(query.encode()).hexdigest()
 
-# Initialize query cache
-query_cache = QueryCache()
 
 # List to store all executed queries
 all_queries = []
@@ -178,20 +189,17 @@ async def execute_sql(query: str) -> str:
     Returns:
         String representation of the query results
     """
+    llm = LLM()
+    llm.start()
     start_time = time.time()
     # Log the query being executed
     logging.info(f"LLM executed SQL query: {query}")
+    db_logger.info(f"Executing SQL query: {query}")
 
     # Store the query
     global all_queries
     
-    # Check if query result is in cache
-    cached_result = query_cache.get(query)
-    if cached_result is not None:
-        execution_time = time.time() - start_time
-        all_queries.append((query, execution_time))
-        logging.info(f'Cache hit for SQL query: {query} (Execution time: {execution_time:.2f}s)')
-        return cached_result
+
     
     try:
         # Get connection from connection manager
@@ -199,13 +207,12 @@ async def execute_sql(query: str) -> str:
         
         # Create a cursor with dictionary-like results
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            is_select = query.strip().upper().startswith('SELECT')
-            
-            # For SELECT queries, prepare the statement to improve performance
-            if is_select:
-                # Execute the query (psycopg2 handles prepared statements internally)
-                cursor.execute(query)
-                
+            # Execute the query
+            cursor.execute(query)
+
+            print("cursor description", cursor.description)            
+            # Check if the query is a SELECT query (returns results)
+            if cursor.description:
                 # Fetch all results
                 results = cursor.fetchall()
                 print("results", results)
@@ -219,24 +226,22 @@ async def execute_sql(query: str) -> str:
                 execution_time = time.time() - start_time
                 all_queries.append((query, execution_time))
                 logging.info(f'LLM executed SQL query: {query} (Execution time: {execution_time:.2f}s)')
-                
-                response = json.dumps({'query_result': formatted_results, 'all_queries': all_queries})
-                # Cache the result for future use
-                query_cache.set(query, response)
-                return response
+                llm.end()
+                return json.dumps({'query_result': formatted_results, 'all_queries': all_queries})
             else:
                 # For non-SELECT queries (INSERT, UPDATE, DELETE)
-                cursor.execute(query)
                 conn.commit()
                 affected_rows = cursor.rowcount
                 print("affected_rows", affected_rows)
                 execution_time = time.time() - start_time
                 all_queries.append((query, execution_time))
                 logging.info(f'LLM executed SQL query: {query} (Execution time: {execution_time:.2f}s)')
+                llm.end()
                 return json.dumps({'query_result': f"Query executed successfully. Rows affected: {affected_rows}", 'all_queries': all_queries})
     
     except Exception as e:
         execution_time = time.time() - start_time
         all_queries.append((query, execution_time))
         logging.error(f'Error executing SQL query: {query} (Execution time: {execution_time:.2f}s) - Error: {str(e)}')
+        llm.end()
         return json.dumps({'query_result': f"Error executing SQL query: {str(e)}", 'all_queries': all_queries})
